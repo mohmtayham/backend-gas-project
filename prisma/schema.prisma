@@ -1,0 +1,273 @@
+// Gas Filling Queue System - Prisma schema (simple version, no authentication)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────── Enums ─────────────
+
+enum Lane {
+  DOMESTIC
+  INDUSTRIAL
+}
+
+// Who made the booking (no login, so the client just says who it is)
+enum ActorRole {
+  AGENT
+  TRANSPORTER
+  STAFF
+}
+
+enum TicketStatus {
+  BOOKED
+  CALLED
+  LOADING
+  COMPLETED
+  SKIPPED
+  SHELVED
+  ABSENT
+  CANCELLED
+}
+
+enum DayStatus {
+  PLANNED
+  BOOKING_OPEN
+  BOOKING_CLOSED
+  IN_PROGRESS
+  CLOSED
+}
+
+enum LinkStatus {
+  PENDING
+  APPROVED
+  REVOKED
+}
+
+enum QuotaPeriod {
+  DAILY
+  WEEKLY
+  MONTHLY
+}
+
+enum Source {
+  MEMBER_APP
+  STAFF
+  WHATSAPP_PASTE
+}
+
+// ───────────── Master data ─────────────
+
+model Agent {
+  id        String   @id @default(uuid())
+  code      String   @unique
+  name      String
+  nameNorm  String // normalised Arabic name, used for search only
+  licenceNo String?
+  phone     String?
+  notes     String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  quotas AgentQuota[]
+  links  AgentTransporterLink[]
+  lines  TicketLine[]
+
+  @@index([nameNorm])
+}
+
+model AgentQuota {
+  id          Int         @id @default(autoincrement())
+  agentId     String
+  fillType    Lane
+  period      QuotaPeriod
+  periodStart DateTime    @db.Date
+  periodEnd   DateTime    @db.Date
+  quotaQty    Int
+
+  agent Agent @relation(fields: [agentId], references: [id])
+
+  @@unique([agentId, fillType, periodStart])
+}
+
+model Transporter {
+  id        String   @id @default(uuid())
+  name      String
+  nameNorm  String
+  phone     String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  vehicles Vehicle[]
+  links    AgentTransporterLink[]
+  tickets  Ticket[]
+
+  @@index([nameNorm])
+}
+
+model Vehicle {
+  id            String   @id @default(uuid())
+  transporterId String
+  plateNo       String   @unique
+  capacityQty   Int
+  fillTypes     Lane[]
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+
+  transporter Transporter @relation(fields: [transporterId], references: [id])
+  tickets     Ticket[]
+}
+
+// A transporter may book for an agent only when the link is APPROVED
+model AgentTransporterLink {
+  id            Int        @id @default(autoincrement())
+  agentId       String
+  transporterId String
+  status        LinkStatus @default(PENDING)
+  requestedBy   ActorRole
+  requestedAt   DateTime   @default(now())
+  decidedAt     DateTime?
+
+  agent       Agent       @relation(fields: [agentId], references: [id])
+  transporter Transporter @relation(fields: [transporterId], references: [id])
+
+  @@unique([agentId, transporterId])
+}
+
+// Physical filling line (البابلين)
+model BayDef {
+  id       Int     @id @default(autoincrement())
+  lane     Lane
+  name     String
+  isActive Boolean @default(true)
+
+  tickets Ticket[]
+}
+
+// ───────────── Queue ─────────────
+
+model QueueDay {
+  id               Int       @id @default(autoincrement())
+  opDate           DateTime  @db.Date
+  lane             Lane
+  status           DayStatus @default(PLANNED)
+  bookingOpensAt   DateTime?
+  bookingClosesAt  DateTime?
+  closedAt         DateTime?
+  linePausedAt     DateTime?
+  pauseReason      String?
+
+  tickets   Ticket[]
+  manifests Manifest[]
+
+  @@unique([opDate, lane])
+}
+
+model Ticket {
+  id              Int          @id @default(autoincrement())
+  bookingNo       Int // permanent number ("كان دور 3")
+  originDayId     Int
+  queueDayId      Int
+  lane            Lane
+  priorityGroup   Int          @default(1) // 0 carried, 1 new, 2 shelved
+  position        Int
+  status          TicketStatus @default(BOOKED)
+  transporterId   String
+  vehicleId       String
+  totalQty        Int
+  bookedByRole    ActorRole
+  actorId         String?
+  source          Source       @default(STAFF)
+  sourceMessageAt DateTime?
+  bayId           Int?
+  carryCount      Int          @default(0)
+  note            String?
+  cancelReason    String?
+  createdBy       String?
+  createdAt       DateTime     @default(now())
+  calledAt         DateTime?
+  loadingStartedAt DateTime?
+  completedAt      DateTime?
+  version         Int          @default(1) // optimistic concurrency
+
+  queueDay    QueueDay    @relation(fields: [queueDayId], references: [id])
+  transporter Transporter @relation(fields: [transporterId], references: [id])
+  vehicle     Vehicle     @relation(fields: [vehicleId], references: [id])
+  bay         BayDef?     @relation(fields: [bayId], references: [id])
+  lines       TicketLine[]
+
+  @@unique([originDayId, bookingNo])
+  @@unique([queueDayId, priorityGroup, position])
+  @@index([queueDayId, status, priorityGroup, position])
+  @@index([vehicleId, queueDayId])
+}
+
+model TicketLine {
+  id        Int    @id @default(autoincrement())
+  ticketId  Int
+  agentId   String
+  qtyBooked Int
+  qtyLoaded Int?
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  agent  Agent  @relation(fields: [agentId], references: [id])
+
+  @@index([ticketId])
+  @@index([agentId])
+}
+
+// Append-only quota ledger: reserved -> consumed -> released
+model QuotaLedger {
+  id            Int      @id @default(autoincrement())
+  agentId       String
+  fillType      Lane
+  periodStart   DateTime @db.Date
+  ticketLineId  Int?
+  reservedDelta Int      @default(0)
+  consumedDelta Int      @default(0)
+  reason        String
+  createdBy     String   @default("system")
+  createdAt     DateTime @default(now())
+
+  @@index([agentId, fillType, periodStart])
+  @@index([ticketLineId])
+}
+
+model Manifest {
+  id            Int      @id @default(autoincrement())
+  queueDayId    Int
+  version       Int
+  serial        String   @unique // G-YYYYMMDD-D-v1
+  generatedAt   DateTime @default(now())
+  contentHash   String
+  exportedText  String
+  superseded    Boolean  @default(false)
+
+  queueDay QueueDay @relation(fields: [queueDayId], references: [id])
+
+  @@unique([queueDayId, version])
+}
+
+model AuditEvent {
+  id         Int      @id @default(autoincrement())
+  ts         DateTime @default(now())
+  actor      String?
+  action     String
+  entity     String
+  entityId   String?
+  beforeJson Json?
+  afterJson  Json?
+  reason     String?
+
+  @@index([entity, entityId])
+}
+
+model Setting {
+  key       String    @id
+  value     String
+  changedAt DateTime? @default(now())
+}
